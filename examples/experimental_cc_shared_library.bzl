@@ -49,7 +49,7 @@ def _create_linker_context(ctx, static_linker_inputs, dynamic_linker_inputs):
     linker_inputs.extend(static_linker_inputs)
 
     return cc_common.create_linking_context(
-        linker_inputs = depset(linker_inputs),
+        linker_inputs = depset(linker_inputs, order = "topological"),
     )
 
 def _merge_cc_shared_library_infos(ctx):
@@ -71,22 +71,46 @@ def _build_exports_map_from_only_dynamic_deps(merged_shared_library_infos):
         exports = entry[0]
         linker_input = entry[1]
         for export in exports:
-            str_export_label = str(export.label)
-            if str_export_label in exports_map:
+            if export in exports_map:
                 fail("Two shared libraries in dependencies export the same symbols. Both " +
-                     exports_map[str_export_label].libraries[0].dynamic_library.short_path +
+                     exports_map[export].libraries[0].dynamic_library.short_path +
                      " and " + linker_input.dynamic_library.short_path +
-                     " export " + str_export_label)
-            exports_map[str(export.label)] = linker_input
+                     " export " + export)
+            exports_map[export] = linker_input
     return exports_map
 
-def _filter_inputs(ctx, transitive_exports):
+def _wrap_static_library_with_alwayslink(ctx, feature_configuration, cc_toolchain, linker_input):
+    new_libraries_to_link = []
+    for old_library_to_link in linker_input.libraries:
+        # TODO(#5200): This will lose the object files from a library to link.
+        # Not too bad for the prototype but as soon as the library_to_link
+        # constructor has object parameters this should be changed.
+        new_library_to_link = cc_common.create_library_to_link(
+            actions = ctx.actions,
+            feature_configuration = feature_configuration,
+            cc_toolchain = cc_toolchain,
+            static_library = old_library_to_link.static_library,
+            pic_static_library = old_library_to_link.pic_static_library,
+            alwayslink = True,
+        )
+        new_libraries_to_link.append(new_library_to_link)
+
+    return cc_common.create_linker_input(
+        owner = linker_input.owner,
+        libraries = depset(direct = new_libraries_to_link),
+        user_link_flags = depset(direct = linker_input.user_link_flags),
+        additional_inputs = depset(direct = linker_input.additional_inputs),
+    )
+
+def _filter_inputs(ctx, feature_configuration, cc_toolchain, transitive_exports):
     static_linker_inputs = []
     dynamic_linker_inputs = []
 
     graph_structure_aspect_nodes = []
     linker_inputs = []
+    direct_exports = {}
     for export in ctx.attr.exports:
+        direct_exports[str(export.label)] = True
         linker_inputs.extend(export[CcInfo].linking_context.linker_inputs.to_list())
         graph_structure_aspect_nodes.append(export[GraphNodeInfo])
 
@@ -102,8 +126,12 @@ def _filter_inputs(ctx, transitive_exports):
     )
 
     already_linked_dynamically = {}
+    owners_seen = {}
     for linker_input in linker_inputs:
         owner = str(linker_input.owner)
+        if owner in owners_seen:
+            continue
+        owners_seen[owner] = True
         if owner in link_dynamically_labels:
             dynamic_linker_input = transitive_exports[owner]
             if str(dynamic_linker_input.owner) not in already_linked_dynamically:
@@ -114,13 +142,19 @@ def _filter_inputs(ctx, transitive_exports):
             for linked_statically_by in link_statically_labels[owner]:
                 if linked_statically_by == str(ctx.label):
                     can_be_linked_statically = True
-                    static_linker_inputs.append(linker_input)
+                    static_linker_input = linker_input
+                    if owner in direct_exports:
+                        static_linker_input = _wrap_static_library_with_alwayslink(
+                            ctx,
+                            feature_configuration,
+                            cc_toolchain,
+                            linker_input,
+                        )
+                    static_linker_inputs.append(static_linker_input)
                     break
             if not can_be_linked_statically:
                 fail("We can't link " +
                      str(owner) + " either statically or dynamically")
-        else:
-            fail("Implementation error, this should not happen")
 
     # Every direct dynamic_dep of this rule will be linked dynamically even if we
     # didn't reach a cc_library exported by one of these dynamic_deps. In other
@@ -129,7 +163,7 @@ def _filter_inputs(ctx, transitive_exports):
     for dep in ctx.attr.dynamic_deps:
         has_a_used_export = False
         for export in dep[CcSharedLibraryInfo].exports:
-            if str(export.label) in link_dynamically_labels:
+            if export in link_dynamically_labels:
                 has_a_used_export = True
                 break
         if not has_a_used_export:
@@ -150,8 +184,14 @@ def _cc_shared_library_impl(ctx):
     exports_map = _build_exports_map_from_only_dynamic_deps(merged_cc_shared_library_info)
     for export in ctx.attr.exports:
         if str(export.label) in exports_map:
-            fail("Trying to export a library already exported by a different shared library: " + str(export.label))
-    (static_linker_inputs, dynamic_linker_inputs) = _filter_inputs(ctx, exports_map)
+            fail("Trying to export a library already exported by a different shared library: " +
+                 str(export.label))
+    (static_linker_inputs, dynamic_linker_inputs) = _filter_inputs(
+        ctx,
+        feature_configuration,
+        cc_toolchain,
+        exports_map,
+    )
 
     linking_context = _create_linker_context(ctx, static_linker_inputs, dynamic_linker_inputs)
 
@@ -175,11 +215,24 @@ def _cc_shared_library_impl(ctx):
         output_type = "dynamic_library",
     )
 
+    runfiles = ctx.runfiles(
+        files = [linking_outputs.library_to_link.resolved_symlink_dynamic_library],
+    )
+    for dep in ctx.attr.dynamic_deps:
+        runfiles = runfiles.merge(dep[DefaultInfo].data_runfiles)
+
+    exports = []
+    for export in ctx.attr.exports:
+        exports.append(str(export.label))
+
     return [
-        DefaultInfo(files = depset([linking_outputs.library_to_link.resolved_symlink_dynamic_library])),
+        DefaultInfo(
+            files = depset([linking_outputs.library_to_link.resolved_symlink_dynamic_library]),
+            runfiles = runfiles,
+        ),
         CcSharedLibraryInfo(
             dynamic_deps = merged_cc_shared_library_info,
-            exports = ctx.attr.exports,
+            exports = exports,
             linker_input = cc_common.create_linker_input(
                 owner = ctx.label,
                 libraries = depset([linking_outputs.library_to_link]),
@@ -218,6 +271,6 @@ cc_shared_library = rule(
         "exports": attr.label_list(aspects = [graph_structure_aspect]),
         "_cc_toolchain": attr.label(default = "@bazel_tools//tools/cpp:current_cc_toolchain"),
     },
-    toolchains = ["//cc:toolchain_type"],
+    toolchains = ["@rules_cc//cc:toolchain_type"],  # copybara-use-repo-external-label
     fragments = ["cpp"],
 )

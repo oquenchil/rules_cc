@@ -19,6 +19,9 @@ cc_shared_library(
     name = "foo_so",
     dynamic_deps = ["bar_so"],
     preloaded_deps = ["preloaded_dep"],
+    static_deps = [
+        "//examples/test_cc_shared_library:qux",
+    ],
     user_link_flags = ["-Wl,-rpath,kittens"],
     visibility_file = "foo.lds",
     exports = [
@@ -72,11 +75,14 @@ cc_library(
     name = "qux",
     srcs = ["qux.cc"],
     hdrs = ["qux.h"],
-    linked_statically_by = ["//examples/test_cc_shared_library:foo_so"],
+    #linked_statically_by = ["//examples/test_cc_shared_library:foo_so"],
 )
 
 cc_shared_library(
     name = "bar_so",
+    static_deps = [
+        "//examples/test_cc_shared_library:qux",
+    ],
     visibility_file = "bar.lds",
     exports = [
         "bar",
@@ -91,6 +97,7 @@ cc_library(
     linked_statically_by = [
         "//examples/test_cc_shared_library:bar_so",
     ],
+    deps = ["qux"],
 )
 
 cc_library(

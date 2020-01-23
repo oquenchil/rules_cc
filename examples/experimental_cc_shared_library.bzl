@@ -9,6 +9,13 @@ load("//cc:find_cc_toolchain.bzl", "find_cc_toolchain")
 
 # TODO(#5200): Add export_define to library_to_link and cc_library
 
+# TODO(plf): Even though at the begining the idea was to completely forbid
+# anyone to link a library statically without permission from the library owner,
+# there have been complaints about this. linked_statically_by is hard to use
+# and too restrictive. We have added the static_deps attribute on top to make
+# this easier. It is not clear whether "static_deps" will completely replace
+# the use of "linked_statically_by" or if they will both co-exist.
+
 GraphNodeInfo = provider(
     fields = {
         "children": "Other GraphNodeInfo from dependencies of this target",
@@ -19,6 +26,7 @@ GraphNodeInfo = provider(
 CcSharedLibraryInfo = provider(
     fields = {
         "dynamic_deps": "All shared libraries depended on transitively",
+        "static_libs": "All libraries linked statically into this library",
         "linker_input": "the resulting linker input artifact for the shared library",
         "preloaded_deps": "cc_libraries needed by this cc_shared_library that should" +
                           " be linked the binary. If this is set, this cc_shared_library has to " +
@@ -69,6 +77,7 @@ def _merge_cc_shared_library_infos(ctx):
         dynamic_dep_entry = (
             dep[CcSharedLibraryInfo].exports,
             dep[CcSharedLibraryInfo].linker_input,
+            dep[CcSharedLibraryInfo].static_libs,
         )
         dynamic_deps.append(dynamic_dep_entry)
         transitive_dynamic_deps.append(dep[CcSharedLibraryInfo].dynamic_deps)
@@ -88,6 +97,20 @@ def _build_exports_map_from_only_dynamic_deps(merged_shared_library_infos):
                      " export " + export)
             exports_map[export] = linker_input
     return exports_map
+
+def _build_static_libs_map(merged_shared_library_infos):
+    static_libs_map = {}
+    for entry in merged_shared_library_infos.to_list():
+        static_libs = entry[2]
+        linker_input = entry[1]
+        for static_lib in static_libs:
+            if static_lib in static_libs_map:
+                fail("Two shared libraries in dependencies link the same library statically. Both " +
+                     static_libs_map[static_lib] +
+                     " and " + str(linker_input.owner) +
+                     " link statically" + static_lib)
+            static_libs_map[static_lib] = str(linker_input.owner)
+    return static_libs_map
 
 def _wrap_static_library_with_alwayslink(ctx, feature_configuration, cc_toolchain, linker_input):
     new_libraries_to_link = []
@@ -117,7 +140,8 @@ def _filter_inputs(
         feature_configuration,
         cc_toolchain,
         transitive_exports,
-        preloaded_deps_direct_labels):
+        preloaded_deps_direct_labels,
+        static_libs_map):
     static_linker_inputs = []
     dynamic_linker_inputs = []
 
@@ -168,6 +192,32 @@ def _filter_inputs(
                         )
                     static_linker_inputs.append(static_linker_input)
                     break
+            if can_be_linked_statically:
+                continue
+
+            # TODO(plf): This may completely end up replacing
+            # linked_statically_by.
+
+            if owner in static_libs_map:
+                fail(owner + " is already linked statically in " +
+                     static_libs_map[owner] + " but not exported")
+
+            # Check if owner is in static_deps_paths.
+            for static_dep_path in ctx.attr.static_deps:
+                # FIXME:  Check repo name properly with label
+                if owner.startswith(static_dep_path):
+                    # FIXME: repeated code
+                    can_be_linked_statically = True
+                    static_linker_input = linker_input
+                    if owner in direct_exports:
+                        static_linker_input = _wrap_static_library_with_alwayslink(
+                            ctx,
+                            feature_configuration,
+                            cc_toolchain,
+                            linker_input,
+                        )
+                    static_linker_inputs.append(static_linker_input)
+
             if not can_be_linked_statically:
                 fail("We can't link " +
                      str(owner) + " either statically or dynamically")
@@ -213,12 +263,14 @@ def _cc_shared_library_impl(ctx):
 
         preloaded_dep_merged_cc_info = cc_common.merge_cc_infos(cc_infos = preloaded_deps_cc_infos)
 
+    static_libs_map = _build_static_libs_map(merged_cc_shared_library_info)
     (static_linker_inputs, dynamic_linker_inputs) = _filter_inputs(
         ctx,
         feature_configuration,
         cc_toolchain,
         exports_map,
         preloaded_deps_direct_labels,
+        static_libs_map,
     )
 
     linking_context = _create_linker_context(ctx, static_linker_inputs, dynamic_linker_inputs)
@@ -256,6 +308,10 @@ def _cc_shared_library_impl(ctx):
     for export in ctx.attr.exports:
         exports.append(str(export.label))
 
+    static_libs = []
+    for static_linker_input in static_linker_inputs:
+        static_libs.append(str(static_linker_input.owner))
+
     return [
         DefaultInfo(
             files = depset([linking_outputs.library_to_link.resolved_symlink_dynamic_library]),
@@ -264,6 +320,7 @@ def _cc_shared_library_impl(ctx):
         CcSharedLibraryInfo(
             dynamic_deps = merged_cc_shared_library_info,
             exports = exports,
+            static_libs = static_libs,
             linker_input = cc_common.create_linker_input(
                 owner = ctx.label,
                 libraries = depset([linking_outputs.library_to_link]),
@@ -299,6 +356,7 @@ cc_shared_library = rule(
     implementation = _cc_shared_library_impl,
     attrs = {
         "dynamic_deps": attr.label_list(providers = [CcSharedLibraryInfo]),
+        "static_deps": attr.string_list(),
         "preloaded_deps": attr.label_list(providers = [CcInfo]),
         "user_link_flags": attr.string_list(),
         "visibility_file": attr.label(allow_single_file = True),

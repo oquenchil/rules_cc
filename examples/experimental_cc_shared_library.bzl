@@ -9,29 +9,22 @@ load("//cc:find_cc_toolchain.bzl", "find_cc_toolchain")
 
 # TODO(#5200): Add export_define to library_to_link and cc_library
 
-# TODO(plf): Even though at the begining the idea was to completely forbid
-# anyone to link a library statically without permission from the library owner,
-# there have been complaints about this. linked_statically_by is hard to use
-# and too restrictive. static_deps will completely replace linked_statically_by.
-# Library authors will still have control of who exports them by using exported_by.
-
 GraphNodeInfo = provider(
     fields = {
         "children": "Other GraphNodeInfo from dependencies of this target",
+        "exported_by": "Labels of targets that can export the library of this node",
         "label": "Label of the target visited",
-        # TODO(plf): Completely remove linked_statically_by.
-        "linked_statically_by": "The value of this attribute if the target has it",
     },
 )
 CcSharedLibraryInfo = provider(
     fields = {
         "dynamic_deps": "All shared libraries depended on transitively",
+        "exports": "cc_libraries that are linked statically and exported",
         "linker_input": "the resulting linker input artifact for the shared library",
         "preloaded_deps": "cc_libraries needed by this cc_shared_library that should" +
                           " be linked the binary. If this is set, this cc_shared_library has to " +
                           " be a direct dependency of the cc_binary",
         "static_libs": "All libraries linked statically into this library",
-        "exports": "cc_libraries that are linked statically and exported",
     },
 )
 
@@ -50,10 +43,11 @@ def _separate_static_and_dynamic_link_libraries(
             break
         node = all_children.pop(0)
 
-        if node.label in can_be_linked_dynamically:
-            link_dynamically_labels[node.label] = None
-        elif node.label not in preloaded_deps_direct_labels:
-            link_statically_labels[node.label] = node.linked_statically_by
+        node_label = str(node.label)
+        if node_label in can_be_linked_dynamically:
+            link_dynamically_labels[node_label] = True
+        elif node_label not in preloaded_deps_direct_labels:
+            link_statically_labels[node_label] = True
             all_children.extend(node.children)
     return (link_statically_labels, link_dynamically_labels)
 
@@ -137,6 +131,22 @@ def _wrap_static_library_with_alwayslink(ctx, feature_configuration, cc_toolchai
         additional_inputs = depset(direct = linker_input.additional_inputs),
     )
 
+def _check_if_target_under_path(path, target, target_specified):
+    if not _same_package_or_above(path, target):
+        return False
+    if target_specified:
+        return path.name == target.name
+    return True
+
+def _is_target_specified(path):
+    if path.startswith("//") or path.startswith("@"):
+        if path.find(":") != -1:
+            return True
+        else:
+            return False
+    else:
+        return True
+
 def _filter_inputs(
         ctx,
         feature_configuration,
@@ -194,19 +204,13 @@ def _filter_inputs(
             else:
                 can_be_linked_statically = False
 
-                # TODO(plf): This loop will go away when linked_statically_by is
-                # replaced completely by static_deps.
-                for linked_statically_by in link_statically_labels[owner]:
-                    if linked_statically_by == str(ctx.label):
+                for static_dep_path in ctx.attr.static_deps:
+                    target_specified = _is_target_specified(static_dep_path)
+                    static_dep_path_label = ctx.label.relative(static_dep_path)
+                    owner_label = linker_input.owner
+                    if _check_if_target_under_path(linker_input.owner, static_dep_path_label, target_specified):
                         can_be_linked_statically = True
                         break
-
-                if not can_be_linked_statically:
-                    for static_dep_path in ctx.attr.static_deps:
-                        if owner.startswith(static_dep_path):
-                            can_be_linked_statically = True
-                            break
-
                 if can_be_linked_statically:
                     static_linker_inputs.append(linker_input)
                 else:
@@ -228,6 +232,18 @@ def _filter_inputs(
 
     return (static_linker_inputs, dynamic_linker_inputs)
 
+def _same_package_or_above(label_a, label_b):
+    if label_a.workspace_name != label_b.workspace_name:
+        return False
+    package_a_tokenized = label_a.package.split("/")
+    package_b_tokenized = label_b.package.split("/")
+    if len(package_b_tokenized) < len(package_a_tokenized):
+        return False
+    for i in range(len(package_a_tokenized)):
+        if package_a_tokenized[i] != package_b_tokenized[i]:
+            return False
+    return True
+
 def _cc_shared_library_impl(ctx):
     cc_toolchain = find_cc_toolchain(ctx)
     feature_configuration = cc_common.configure_features(
@@ -243,6 +259,20 @@ def _cc_shared_library_impl(ctx):
         if str(export.label) in exports_map:
             fail("Trying to export a library already exported by a different shared library: " +
                  str(export.label))
+
+        can_be_exported = _same_package_or_above(ctx.label, export.label)
+
+        if not can_be_exported:
+            for exported_by in export[GraphNodeInfo].exported_by:
+                target_specified = _is_target_specified(exported_by)
+                exported_by_label = Label(exported_by)
+                if _check_if_target_under_path(ctx.label, exported_by_label, target_specified):
+                    can_be_exported = True
+                    break
+        if not can_be_exported:
+            fail(str(export.label) + " cannot be exported from " + str(ctx.label) +
+                 " because it's not in the same package/subpackage or the library " +
+                 "to be exported doesn't have this cc_shared_library in the exported_by tag.")
 
     preloaded_deps_direct_labels = {}
     preloaded_dep_merged_cc_info = None
@@ -328,14 +358,24 @@ def _graph_structure_aspect_impl(target, ctx):
             if GraphNodeInfo in dep:
                 children.append(dep[GraphNodeInfo])
 
-    linked_statically_by = []
-    if hasattr(ctx.rule.attr, "linked_statically_by"):
-        linked_statically_by = [str(label) for label in ctx.rule.attr.linked_statically_by]
+    exported_by = []
+    if hasattr(ctx.rule.attr, "tags"):
+        for tag in ctx.rule.attr.tags:
+            if tag.startswith("exported_by=") and len(tag) > 12:
+                for target in tag[12:].split(","):
+                    # Only absolute labels allowed. Targets in same package
+                    # or subpackage can be exported anyway.
+                    if not target.startswith("//") and not target.startswith("@"):
+                        fail("Labels in exported_by of " + str(target) +
+                             " must be absolute.")
+
+                    Label(target)  # Checking synthax is ok.
+                exported_by.append(target)
 
     return [GraphNodeInfo(
-        label = str(ctx.label),
-        linked_statically_by = linked_statically_by,
+        label = ctx.label,
         children = children,
+        exported_by = exported_by,
     )]
 
 graph_structure_aspect = aspect(
@@ -347,14 +387,11 @@ cc_shared_library = rule(
     implementation = _cc_shared_library_impl,
     attrs = {
         "dynamic_deps": attr.label_list(providers = [CcSharedLibraryInfo]),
+        "exports": attr.label_list(providers = [CcInfo], aspects = [graph_structure_aspect]),
         "preloaded_deps": attr.label_list(providers = [CcInfo]),
-        # TODO(plf): Replaces linked_statically_by attribute. Instead of
-        # linked_statically_by attribute in each cc_library we will have the
-        # attribute exported_by which will restrict exportability.
         "static_deps": attr.string_list(),
         "user_link_flags": attr.string_list(),
         "visibility_file": attr.label(allow_single_file = True),
-        "exports": attr.label_list(providers = [CcInfo], aspects = [graph_structure_aspect]),
         "_cc_toolchain": attr.label(default = "@bazel_tools//tools/cpp:current_cc_toolchain"),
     },
     toolchains = ["@rules_cc//cc:toolchain_type"],  # copybara-use-repo-external-label

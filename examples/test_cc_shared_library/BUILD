@@ -24,6 +24,7 @@ cc_shared_library(
     name = "foo_so",
     additional_linker_inputs = [
         ":foo.lds",
+        ":foo.def",
         ":additional_script.txt",
     ],
     dynamic_deps = ["bar_so"],
@@ -33,10 +34,13 @@ cc_shared_library(
         "//examples/test_cc_shared_library:qux2",
     ],
     user_link_flags = [
-        "-Wl,-rpath,kittens",
-        "-Wl,--version-script=$(location :foo.lds)",
-        "-Wl,--script=$(location :additional_script.txt)",
+        "/DEF:$(location :foo.def)",
     ],
+#    user_link_flags = [
+#        "-Wl,-rpath,kittens",
+#        "-Wl,--version-script=$(location :foo.lds)",
+#        "-Wl,--script=$(location :additional_script.txt)",
+#    ],
     exports = [
         "foo",
         # Not a problem to export "baz" which is depended on by foo
@@ -61,6 +65,7 @@ cc_library(
     name = "preloaded_dep",
     srcs = ["preloaded_dep.cc"],
     hdrs = ["preloaded_dep.h"],
+    features = ["windows_export_all_symbols"],
 )
 
 cc_library(
@@ -100,6 +105,7 @@ cc_shared_library(
     name = "bar_so",
     additional_linker_inputs = [
         ":bar.lds",
+        ":bar.def",
     ],
     static_deps = [
         "//examples/test_cc_shared_library:barX",
@@ -107,8 +113,11 @@ cc_shared_library(
         "//examples/test_cc_shared_library:qux2",
     ],
     user_link_flags = [
-        "-Wl,--version-script=$(location :bar.lds)",
+        "/DEF:$(location :bar.def)",
     ],
+#    user_link_flags = [
+#        "-Wl,--version-script=$(location :bar.lds)",
+#    ],
     exports = [
         "bar",
         "bar2",

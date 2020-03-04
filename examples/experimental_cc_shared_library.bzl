@@ -225,6 +225,14 @@ def _filter_inputs(
                     fail("We can't link " +
                          str(owner) + " either statically or dynamically")
 
+    for preloaded_dep in ctx.attr.preloaded_deps:
+        library = preloaded_dep[CcInfo].linking_context.linker_inputs.to_list()[0].libraries[0]
+        if library.interface_library == None:
+            print("BAZEL MESSAGE: was None")
+        new_library = cc_common.create_library_to_link(actions = ctx.actions, feature_configuration = feature_configuration, cc_toolchain = cc_toolchain, interface_library = library.interface_library)
+        new_linker_input = cc_common.create_linker_input(owner = preloaded_dep[CcInfo].linking_context.linker_inputs.to_list()[0].owner, libraries = depset(direct = [new_library]))
+        linker_inputs.append(new_linker_input)
+
     return (linker_inputs, link_once_static_libs)
 
 def _same_package_or_above(label_a, label_b):
@@ -307,8 +315,15 @@ def _cc_shared_library_impl(ctx):
         output_type = "dynamic_library",
     )
 
+    shared_library = linking_outputs.library_to_link.resolved_symlink_dynamic_library
+    if shared_library == None:
+        shared_library = linking_outputs.library_to_link.dynamic_library
+
+    if shared_library == None:
+        fail("Did not produce a dynamic library")
+
     runfiles = ctx.runfiles(
-        files = [linking_outputs.library_to_link.resolved_symlink_dynamic_library],
+        files = [shared_library],
     )
     for dep in ctx.attr.dynamic_deps:
         runfiles = runfiles.merge(dep[DefaultInfo].data_runfiles)
@@ -319,7 +334,7 @@ def _cc_shared_library_impl(ctx):
 
     return [
         DefaultInfo(
-            files = depset([linking_outputs.library_to_link.resolved_symlink_dynamic_library]),
+            files = depset([shared_library]),
             runfiles = runfiles,
         ),
         CcSharedLibraryInfo(

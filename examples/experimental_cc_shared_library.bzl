@@ -9,22 +9,40 @@ load("//cc:find_cc_toolchain.bzl", "find_cc_toolchain")
 
 # TODO(#5200): Add export_define to library_to_link and cc_library
 
+# Add this as a tag to any target that can be linked by more than one
+# cc_shared_library because it doesn't have static initializers or anything
+# else that may cause issues when being linked more than once. This should be
+# used sparingly after making sure it's safe to use.
+LINKABLE_MORE_THAN_ONCE = "LINKABLE_MORE_THAN_ONCE"
+
+_EXPORTED_BY_TAG_BEGINNING = "exported_by="
+
+def exported_by(labels):
+    str_builder = []
+    for label in labels:
+        str_builder.append(label)
+    return _EXPORTED_BY_TAG_BEGINNING + ",".join(str_builder)
+
 GraphNodeInfo = provider(
     fields = {
         "children": "Other GraphNodeInfo from dependencies of this target",
         "exported_by": "Labels of targets that can export the library of this node",
         "label": "Label of the target visited",
+        "linkable_more_than_once": "Linkable into more than a single cc_shared_library",
     },
 )
 CcSharedLibraryInfo = provider(
     fields = {
         "dynamic_deps": "All shared libraries depended on transitively",
         "exports": "cc_libraries that are linked statically and exported",
+        "link_once_static_libs": "All libraries linked statically into this library that should " +
+                                 "only be linked once, e.g. because they have static " +
+                                 "initializers. If we try to link them more than once, " +
+                                 "we will throw an error",
         "linker_input": "the resulting linker input artifact for the shared library",
         "preloaded_deps": "cc_libraries needed by this cc_shared_library that should" +
                           " be linked the binary. If this is set, this cc_shared_library has to " +
                           " be a direct dependency of the cc_binary",
-        "static_libs": "All libraries linked statically into this library",
     },
 )
 
@@ -47,7 +65,7 @@ def _separate_static_and_dynamic_link_libraries(
         if node_label in can_be_linked_dynamically:
             link_dynamically_labels[node_label] = True
         elif node_label not in preloaded_deps_direct_labels:
-            link_statically_labels[node_label] = True
+            link_statically_labels[node_label] = node.linkable_more_than_once
             all_children.extend(node.children)
     return (link_statically_labels, link_dynamically_labels)
 
@@ -67,7 +85,7 @@ def _merge_cc_shared_library_infos(ctx):
         dynamic_dep_entry = (
             dep[CcSharedLibraryInfo].exports,
             dep[CcSharedLibraryInfo].linker_input,
-            dep[CcSharedLibraryInfo].static_libs,
+            dep[CcSharedLibraryInfo].link_once_static_libs,
         )
         dynamic_deps.append(dynamic_dep_entry)
         transitive_dynamic_deps.append(dep[CcSharedLibraryInfo].dynamic_deps)
@@ -88,19 +106,19 @@ def _build_exports_map_from_only_dynamic_deps(merged_shared_library_infos):
             exports_map[export] = linker_input
     return exports_map
 
-def _build_static_libs_map(merged_shared_library_infos):
-    static_libs_map = {}
+def _build_link_once_static_libs_map(merged_shared_library_infos):
+    link_once_static_libs_map = {}
     for entry in merged_shared_library_infos.to_list():
-        static_libs = entry[2]
+        link_once_static_libs = entry[2]
         linker_input = entry[1]
-        for static_lib in static_libs:
-            if static_lib in static_libs_map:
+        for static_lib in link_once_static_libs:
+            if static_lib in link_once_static_libs_map:
                 fail("Two shared libraries in dependencies link the same " +
-                     " library statically. Both " + static_libs_map[static_lib] +
+                     " library statically. Both " + link_once_static_libs_map[static_lib] +
                      " and " + str(linker_input.owner) +
                      " link statically" + static_lib)
-            static_libs_map[static_lib] = str(linker_input.owner)
-    return static_libs_map
+            link_once_static_libs_map[static_lib] = str(linker_input.owner)
+    return link_once_static_libs_map
 
 def _wrap_static_library_with_alwayslink(ctx, feature_configuration, cc_toolchain, linker_input):
     new_libraries_to_link = []
@@ -125,21 +143,15 @@ def _wrap_static_library_with_alwayslink(ctx, feature_configuration, cc_toolchai
         additional_inputs = depset(direct = linker_input.additional_inputs),
     )
 
-def _check_if_target_under_path(path, target, target_specified):
-    if not _same_package_or_above(path, target):
+def _check_if_target_under_path(value, pattern):
+    if pattern.workspace_name != value.workspace_name:
         return False
-    if target_specified:
-        return path.name == target.name
-    return True
+    if pattern.name == "__pkg__":
+        return pattern.package == value.package
+    if pattern.name == "__subpackages__":
+        return _same_package_or_above(pattern, value)
 
-def _is_target_specified(path):
-    if path.startswith("//") or path.startswith("@"):
-        if path.find(":") != -1:
-            return True
-        else:
-            return False
-    else:
-        return True
+    return pattern.package == value.package and pattern.name == value.name
 
 def _filter_inputs(
         ctx,
@@ -147,9 +159,9 @@ def _filter_inputs(
         cc_toolchain,
         transitive_exports,
         preloaded_deps_direct_labels,
-        static_libs_map):
+        link_once_static_libs_map):
     linker_inputs = []
-    static_libs = []
+    link_once_static_libs = []
 
     graph_structure_aspect_nodes = []
     dependency_linker_inputs = []
@@ -181,9 +193,9 @@ def _filter_inputs(
             dynamic_linker_input = transitive_exports[owner]
             linker_inputs.append(dynamic_linker_input)
         elif owner in link_statically_labels:
-            if owner in static_libs_map:
+            if owner in link_once_static_libs_map:
                 fail(owner + " is already linked statically in " +
-                     static_libs_map[owner] + " but not exported")
+                     link_once_static_libs_map[owner] + " but not exported")
 
             if owner in direct_exports:
                 wrapped_library = _wrap_static_library_with_alwayslink(
@@ -193,26 +205,27 @@ def _filter_inputs(
                     linker_input,
                 )
 
-                static_libs.append(owner)
+                if not link_statically_labels[owner]:
+                    link_once_static_libs.append(owner)
                 linker_inputs.append(wrapped_library)
             else:
                 can_be_linked_statically = False
 
                 for static_dep_path in ctx.attr.static_deps:
-                    target_specified = _is_target_specified(static_dep_path)
                     static_dep_path_label = ctx.label.relative(static_dep_path)
                     owner_label = linker_input.owner
-                    if _check_if_target_under_path(linker_input.owner, static_dep_path_label, target_specified):
+                    if _check_if_target_under_path(linker_input.owner, static_dep_path_label):
                         can_be_linked_statically = True
                         break
                 if can_be_linked_statically:
-                    static_libs.append(owner)
+                    if not link_statically_labels[owner]:
+                        link_once_static_libs.append(owner)
                     linker_inputs.append(linker_input)
                 else:
                     fail("We can't link " +
                          str(owner) + " either statically or dynamically")
 
-    return (linker_inputs, static_libs)
+    return (linker_inputs, link_once_static_libs)
 
 def _same_package_or_above(label_a, label_b):
     if label_a.workspace_name != label_b.workspace_name:
@@ -227,6 +240,7 @@ def _same_package_or_above(label_a, label_b):
     return True
 
 def _cc_shared_library_impl(ctx):
+    cc_common.check_experimental_cc_shared_library()
     cc_toolchain = find_cc_toolchain(ctx)
     feature_configuration = cc_common.configure_features(
         ctx = ctx,
@@ -246,9 +260,8 @@ def _cc_shared_library_impl(ctx):
 
         if not can_be_exported:
             for exported_by in export[GraphNodeInfo].exported_by:
-                target_specified = _is_target_specified(exported_by)
                 exported_by_label = Label(exported_by)
-                if _check_if_target_under_path(ctx.label, exported_by_label, target_specified):
+                if _check_if_target_under_path(ctx.label, exported_by_label):
                     can_be_exported = True
                     break
         if not can_be_exported:
@@ -266,15 +279,15 @@ def _cc_shared_library_impl(ctx):
 
         preloaded_dep_merged_cc_info = cc_common.merge_cc_infos(cc_infos = preloaded_deps_cc_infos)
 
-    static_libs_map = _build_static_libs_map(merged_cc_shared_library_info)
+    link_once_static_libs_map = _build_link_once_static_libs_map(merged_cc_shared_library_info)
 
-    (linker_inputs, static_libs) = _filter_inputs(
+    (linker_inputs, link_once_static_libs) = _filter_inputs(
         ctx,
         feature_configuration,
         cc_toolchain,
         exports_map,
         preloaded_deps_direct_labels,
-        static_libs_map,
+        link_once_static_libs_map,
     )
 
     linking_context = _create_linker_context(ctx, linker_inputs)
@@ -312,7 +325,7 @@ def _cc_shared_library_impl(ctx):
         CcSharedLibraryInfo(
             dynamic_deps = merged_cc_shared_library_info,
             exports = exports,
-            static_libs = static_libs,
+            link_once_static_libs = link_once_static_libs,
             linker_input = cc_common.create_linker_input(
                 owner = ctx.label,
                 libraries = depset([linking_outputs.library_to_link]),
@@ -330,10 +343,11 @@ def _graph_structure_aspect_impl(target, ctx):
                 children.append(dep[GraphNodeInfo])
 
     exported_by = []
+    linkable_more_than_once = False
     if hasattr(ctx.rule.attr, "tags"):
         for tag in ctx.rule.attr.tags:
-            if tag.startswith("exported_by=") and len(tag) > 12:
-                for target in tag[12:].split(","):
+            if tag.startswith(_EXPORTED_BY_TAG_BEGINNING) and len(tag) > len(_EXPORTED_BY_TAG_BEGINNING):
+                for target in tag[len(_EXPORTED_BY_TAG_BEGINNING):].split(","):
                     # Only absolute labels allowed. Targets in same package
                     # or subpackage can be exported anyway.
                     if not target.startswith("//") and not target.startswith("@"):
@@ -342,11 +356,14 @@ def _graph_structure_aspect_impl(target, ctx):
 
                     Label(target)  # Checking synthax is ok.
                 exported_by.append(target)
+            elif tag == LINKABLE_MORE_THAN_ONCE:
+                linkable_more_than_once = True
 
     return [GraphNodeInfo(
         label = ctx.label,
         children = children,
         exported_by = exported_by,
+        linkable_more_than_once = linkable_more_than_once,
     )]
 
 graph_structure_aspect = aspect(
@@ -368,3 +385,5 @@ cc_shared_library = rule(
     toolchains = ["@rules_cc//cc:toolchain_type"],  # copybara-use-repo-external-label
     fragments = ["cpp"],
 )
+
+for_testing_dont_use_check_if_target_under_path = _check_if_target_under_path

@@ -14,3 +14,11 @@
 
 # A collection of examples showing the usage of rules_cc
 licenses(["notice"])
+
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+
+bool_flag(
+    name = "incompatible_link_once",
+    build_setting_default = False,
+    visibility = ["//visibility:public"],
+)
